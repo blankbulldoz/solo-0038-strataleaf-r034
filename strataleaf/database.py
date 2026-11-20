@@ -40,8 +40,18 @@ class Database:
     def get(self, collection, key, revision=None):
         return read_record(self._store, collection, key, revision)
 
-    def query(self, collection, predicate=None, limit=100, cursor=None, revision=None, force_scan=False):
-        return self._queries.select(collection, predicate, limit, cursor, revision, force_scan)
+    def query(self, collection, predicate=None, limit=100, cursor=None, revision=None, force_scan=False,
+              order_by=None, sort=None):
+        """Filter one collection at a fixed revision and return a stable page.
+
+        ``order_by`` accepts a dotted field name, ``{"field", "direction"}``
+        or a sequence of those. Omitted ordering keeps the historical
+        ascending document-key order. Document key is always the final
+        tie-breaker, and the continuation cursor binds the full ordering.
+        ``sort`` is accepted as an alias for ``order_by``.
+        """
+        return self._queries.select(collection, predicate, limit, cursor, revision, force_scan,
+                                    order_by=order_by, sort=sort)
 
     def patch(self, collection, key, patch, expected=None):
         return patch_document(self._store, collection, key, patch, expected)

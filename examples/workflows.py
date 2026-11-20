@@ -59,7 +59,50 @@ def run(flow):
                     cursor = next_page.cursor
                 if keys != [f"seg_{i:02}" for i in range(6)]:
                     raise RuntimeError("read revision changed during pagination")
-                output = {"revision": page.revision, "keys": keys, "foreign_query": rejected(lambda: db.query("segments", cursor=page.cursor), InvalidCursor)}
+                if page.plan["ordering"] != "key":
+                    raise RuntimeError("historical key ordering not used by default")
+
+                # Field ordering: duplicate values, missing/null/mixed types and
+                # document key as the final tie-breaker.
+                db.catalog.create("ranked", {})
+                db.batch().put("ranked", "a", {"group": "x", "weight": 2}).put(
+                    "ranked", "b", {"group": "x", "weight": 2}).put(
+                    "ranked", "c", {"group": "x", "weight": 1}).put(
+                    "ranked", "d", {"group": "x"}).put(
+                    "ranked", "e", {"group": "x", "weight": None}).put(
+                    "ranked", "f", {"group": "x", "weight": "2"}).put(
+                    "ranked", "g", {"group": "y", "weight": 2}).commit()
+                order = [{"field": "group", "direction": "asc"}, {"field": "weight", "direction": "desc"}]
+                ordered = db.query("ranked", order_by=order, limit=3)
+                ordered_cursor, seen = ordered.cursor, [row.key for row in ordered.records]
+                while ordered_cursor:
+                    more = db.query("ranked", order_by=order, limit=3, cursor=ordered_cursor)
+                    seen.extend(row.key for row in more.records)
+                    ordered_cursor = more.cursor
+                # group asc (x < y); weight desc reverses the full type order, so
+                # string "2" > number 2 > number 1 > null > missing. Equal sort
+                # values fall back to key asc ("a" before "b").
+                if seen != ["f", "a", "b", "c", "e", "d", "g"]:
+                    raise RuntimeError("field ordering is not stable: " + repr(seen))
+                # Writes during pagination neither leak in nor drop rows because
+                # every page reads the revision bound to the cursor.
+                first_page = db.query("ranked", order_by=order, limit=2)
+                db.batch().put("ranked", "a", {"group": "z", "weight": 9}).delete("ranked", "g").commit()
+                rest = []
+                cursor = first_page.cursor
+                while cursor:
+                    next_page = db.query("ranked", order_by=order, limit=2, cursor=cursor)
+                    rest.extend(row.key for row in next_page.records)
+                    cursor = next_page.cursor
+                if [row.key for row in first_page.records] + rest != seen:
+                    raise RuntimeError("field ordering changed while writes happened")
+                shifted = rejected(lambda: db.query("ranked", order_by="group", cursor=first_page.cursor), InvalidCursor)
+                historical = db.query("ranked", order_by=order, revision=page.revision)
+                output = {"revision": page.revision, "keys": keys, "ordering": ordered.plan,
+                          "ordered_keys": seen, "after_writes": [row.key for row in first_page.records] + rest,
+                          "foreign_query": rejected(lambda: db.query("segments", cursor=page.cursor), InvalidCursor),
+                          "changed_order": shifted, "historical_path": historical.plan["revision_path"],
+                          "legacy_cursor": page.plan["ordering"]}
             elif flow == "index":
                 db.indexes.create("segments", "by_region", "region")
                 db.indexes.create("segments", "unique_code", "code", unique=True)
